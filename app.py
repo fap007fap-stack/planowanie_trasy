@@ -65,8 +65,8 @@ st.markdown(
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def cached_routes(origin: str, destination: str):
-    return get_routes(origin, destination)
+def cached_routes(origin: str, destination: str, key: str):
+    return get_routes(origin, destination, key)
 
 
 def cached_incidents(route: RouteResult, key: str):
@@ -261,13 +261,13 @@ if submitted or "analysis" not in st.session_state:
         fragile=fragile,
     )
     vehicle = select_vehicle(cargo)
+    api_key = api_key_input or secret("TOMTOM_API_KEY")
     with st.spinner("Wyznaczam korytarze i pobieram dane operacyjne…"):
         try:
-            routes, location_notes = cached_routes(origin.strip(), destination.strip())
+            routes, location_notes = cached_routes(origin.strip(), destination.strip(), api_key)
         except Exception as exc:
             st.error(f"Nie udało się wyznaczyć trasy: {exc}")
             st.stop()
-        api_key = api_key_input or secret("TOMTOM_API_KEY")
         incidents_by_route: list[list[dict[str, Any]]] = []
         live_errors: list[str] = []
         for route in routes:
