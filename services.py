@@ -308,7 +308,7 @@ def get_tomtom_incidents(route: RouteResult, api_key: str) -> list[dict[str, Any
     attributes = (
         "incidents(type,geometry(type,coordinates),properties("
         "id,iconCategory,magnitudeOfDelay,events(description,code,iconCategory),"
-        "startTime,endTime,from,to,length,delay,roadNumbers))"
+        "startTime,endTime,from,to,lengthInMeters,delayInSeconds,roadNumbers))"
     )
     incidents: dict[str, dict[str, Any]] = {}
     errors: list[RuntimeError] = []
