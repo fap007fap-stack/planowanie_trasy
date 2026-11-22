@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import atan2, cos, radians, sin, sqrt
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -39,7 +40,38 @@ KNOWN_POINTS: dict[str, tuple[float, float]] = {
 }
 
 
-def geocode(query: str) -> tuple[float, float, str]:
+def _tomtom_geocode(query: str, api_key: str) -> tuple[float, float, str] | None:
+    encoded_query = quote(query, safe="")
+    for country_set in ("PL", None):
+        params = {"key": api_key, "limit": 1, "language": "pl-PL"}
+        if country_set:
+            params["countrySet"] = country_set
+        try:
+            response = requests.get(
+                f"https://api.tomtom.com/search/2/geocode/{encoded_query}.json",
+                params=params,
+                headers={"User-Agent": USER_AGENT},
+                timeout=TIMEOUT,
+            )
+            response.raise_for_status()
+            results = response.json().get("results", [])
+            if results:
+                result = results[0]
+                position = result["position"]
+                address = result.get("address", {})
+                label = address.get("freeformAddress") or address.get("municipality") or query
+                return float(position["lat"]), float(position["lon"]), label
+        except (requests.RequestException, ValueError, TypeError, KeyError):
+            continue
+    return None
+
+
+def geocode(query: str, api_key: str = "") -> tuple[float, float, str]:
+    if api_key:
+        tomtom_result = _tomtom_geocode(query, api_key)
+        if tomtom_result:
+            return tomtom_result
+
     photon_queries = [f"{query}, Polska", query]
     for photon_query in photon_queries:
         try:
@@ -55,7 +87,12 @@ def geocode(query: str) -> tuple[float, float, str]:
                 feature = features[0]
                 lon, lat = feature["geometry"]["coordinates"][:2]
                 props = feature.get("properties", {})
-                label_parts = [props.get("name"), props.get("city"), props.get("state"), props.get("country")]
+                label_parts = [
+                    props.get("name"),
+                    props.get("city"),
+                    props.get("state"),
+                    props.get("country"),
+                ]
                 label = ", ".join(dict.fromkeys(part for part in label_parts if part))
                 return float(lat), float(lon), label or query
         except (requests.RequestException, ValueError, TypeError, KeyError):
@@ -82,7 +119,55 @@ def geocode(query: str) -> tuple[float, float, str]:
     raise ValueError(f"Nie znaleziono lokalizacji: {query}")
 
 
-def _osrm_route(points: list[tuple[float, float]], alternatives: bool = False) -> list[dict[str, Any]]:
+def _tomtom_route(
+    points: list[tuple[float, float]], api_key: str, alternatives: bool
+) -> list[dict[str, Any]]:
+    locations = ":".join(f"{lat},{lon}" for lat, lon in points)
+    response = requests.get(
+        f"https://api.tomtom.com/routing/1/calculateRoute/{locations}/json",
+        params={
+            "key": api_key,
+            "travelMode": "truck",
+            "routeType": "fastest",
+            "traffic": "true",
+            "routeRepresentation": "polyline",
+            "maxAlternatives": 1 if alternatives else 0,
+        },
+        headers={"User-Agent": USER_AGENT},
+        timeout=TIMEOUT,
+    )
+    response.raise_for_status()
+    normalized: list[dict[str, Any]] = []
+    for route in response.json().get("routes", []):
+        summary = route.get("summary", {})
+        coordinates: list[list[float]] = []
+        for leg in route.get("legs", []):
+            for point in leg.get("points", []):
+                coordinate = [float(point["longitude"]), float(point["latitude"])]
+                if not coordinates or coordinate != coordinates[-1]:
+                    coordinates.append(coordinate)
+        if len(coordinates) >= 2:
+            normalized.append(
+                {
+                    "distance": float(summary.get("lengthInMeters", 0.0)),
+                    "duration": float(summary.get("travelTimeInSeconds", 0.0)),
+                    "geometry": {"coordinates": coordinates},
+                    "legs": [],
+                }
+            )
+    if not normalized:
+        raise ValueError("TomTom Routing nie zwrócił trasy.")
+    return normalized
+
+
+def _osrm_route(
+    points: list[tuple[float, float]], alternatives: bool = False, api_key: str = ""
+) -> list[dict[str, Any]]:
+    if api_key:
+        try:
+            return _tomtom_route(points, api_key, alternatives)
+        except (requests.RequestException, ValueError, TypeError, KeyError):
+            pass
     path = ";".join(f"{lon},{lat}" for lat, lon in points)
     params = {
         "overview": "full",
@@ -167,6 +252,7 @@ def _ensure_alternative(
     routes: list[dict[str, Any]],
     start: tuple[float, float],
     end: tuple[float, float],
+    api_key: str = "",
 ) -> list[dict[str, Any]]:
     if len(routes) >= 2:
         return routes[:2]
@@ -175,7 +261,7 @@ def _ensure_alternative(
     candidates: list[dict[str, Any]] = []
     for waypoint in _detour_candidates(start, end):
         try:
-            candidate = _osrm_route([start, waypoint, end])[0]
+            candidate = _osrm_route([start, waypoint, end], api_key=api_key)[0]
         except Exception:
             continue
         ratio = float(candidate["distance"]) / max(primary_distance, 1.0)
@@ -189,11 +275,11 @@ def _ensure_alternative(
     return [primary, duplicate]
 
 
-def get_routes(origin: str, destination: str) -> tuple[list[RouteResult], list[str]]:
+def get_routes(origin: str, destination: str, api_key: str = "") -> tuple[list[RouteResult], list[str]]:
     notes: list[str] = []
     try:
-        start_lat, start_lon, start_label = geocode(origin)
-        end_lat, end_lon, end_label = geocode(destination)
+        start_lat, start_lon, start_label = geocode(origin, api_key)
+        end_lat, end_lon, end_label = geocode(destination, api_key)
         notes.extend([f"Start: {start_label}", f"Cel: {end_label}"])
 
         if _known_corridors(origin, destination):
@@ -211,7 +297,9 @@ def get_routes(origin: str, destination: str) -> tuple[list[RouteResult], list[s
             ]
             results: list[RouteResult] = []
             for name, color, vias, labels, motorway_share in specs:
-                route = _osrm_route([(start_lat, start_lon), *vias, (end_lat, end_lon)])[0]
+                route = _osrm_route(
+                    [(start_lat, start_lon), *vias, (end_lat, end_lon)], api_key=api_key
+                )[0]
                 results.append(
                     RouteResult(
                         name=name,
@@ -229,8 +317,8 @@ def get_routes(origin: str, destination: str) -> tuple[list[RouteResult], list[s
 
         start = (start_lat, start_lon)
         end = (end_lat, end_lon)
-        raw = _osrm_route([start, end], alternatives=True)
-        raw = _ensure_alternative(raw, start, end)
+        raw = _osrm_route([start, end], alternatives=True, api_key=api_key)
+        raw = _ensure_alternative(raw, start, end, api_key)
         colors = ["#18c89b", "#ff9f43"]
         results = []
         for index, route in enumerate(raw[:2]):
