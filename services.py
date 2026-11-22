@@ -40,42 +40,75 @@ KNOWN_POINTS: dict[str, tuple[float, float]] = {
 
 
 def geocode(query: str) -> tuple[float, float, str]:
+    photon_queries = [f"{query}, Polska", query]
+    for photon_query in photon_queries:
+        try:
+            response = requests.get(
+                "https://photon.komoot.io/api/",
+                params={"q": photon_query, "limit": 1, "lang": "pl"},
+                headers={"User-Agent": USER_AGENT},
+                timeout=TIMEOUT,
+            )
+            response.raise_for_status()
+            features = response.json().get("features", [])
+            if features:
+                feature = features[0]
+                lon, lat = feature["geometry"]["coordinates"][:2]
+                props = feature.get("properties", {})
+                label_parts = [props.get("name"), props.get("city"), props.get("state"), props.get("country")]
+                label = ", ".join(dict.fromkeys(part for part in label_parts if part))
+                return float(lat), float(lon), label or query
+        except (requests.RequestException, ValueError, TypeError, KeyError):
+            continue
+
     searches = [
         {"q": query, "format": "jsonv2", "limit": 1, "countrycodes": "pl"},
         {"q": query, "format": "jsonv2", "limit": 1},
     ]
     for params in searches:
-        response = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params=params,
-            headers={"User-Agent": USER_AGENT},
-            timeout=TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
-        if data:
-            return float(data[0]["lat"]), float(data[0]["lon"]), data[0]["display_name"]
+        try:
+            response = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params=params,
+                headers={"User-Agent": USER_AGENT},
+                timeout=TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if data:
+                return float(data[0]["lat"]), float(data[0]["lon"]), data[0]["display_name"]
+        except (requests.RequestException, ValueError, TypeError, KeyError):
+            continue
     raise ValueError(f"Nie znaleziono lokalizacji: {query}")
 
 
 def _osrm_route(points: list[tuple[float, float]], alternatives: bool = False) -> list[dict[str, Any]]:
     path = ";".join(f"{lon},{lat}" for lat, lon in points)
-    response = requests.get(
-        f"https://router.project-osrm.org/route/v1/driving/{path}",
-        params={
-            "overview": "full",
-            "geometries": "geojson",
-            "steps": "true",
-            "alternatives": "true" if alternatives else "false",
-        },
-        headers={"User-Agent": USER_AGENT},
-        timeout=TIMEOUT,
-    )
-    response.raise_for_status()
-    data = response.json()
-    if data.get("code") != "Ok" or not data.get("routes"):
-        raise ValueError("Silnik trasowania nie zwrócił trasy.")
-    return data["routes"]
+    params = {
+        "overview": "full",
+        "geometries": "geojson",
+        "steps": "true",
+        "alternatives": "true" if alternatives else "false",
+    }
+    providers = [
+        "https://router.project-osrm.org/route/v1/driving",
+        "https://routing.openstreetmap.de/routed-car/route/v1/driving",
+    ]
+    for provider in providers:
+        try:
+            response = requests.get(
+                f"{provider}/{path}",
+                params=params,
+                headers={"User-Agent": USER_AGENT},
+                timeout=TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if data.get("code") == "Ok" and data.get("routes"):
+                return data["routes"]
+        except (requests.RequestException, ValueError, TypeError):
+            continue
+    raise ValueError("Publiczne serwery trasowania są chwilowo niedostępne. Spróbuj ponownie za moment.")
 
 
 def _known_corridors(origin: str, destination: str) -> bool:
